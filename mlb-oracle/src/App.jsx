@@ -1,0 +1,1457 @@
+import { useState, useEffect, useCallback } from "react";
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const API = "/mlb-api";
+const TZ = "America/Los_Angeles"; // Hora del Pacífico
+
+const fmtTime = (dateVal) => {
+  if (!dateVal) return "TBD";
+  return new Date(dateVal).toLocaleTimeString("es-MX", {
+    hour: "2-digit", minute: "2-digit", timeZone: TZ
+  }) + " PT";
+};
+
+// ─── MLB API ──────────────────────────────────────────────────────────────────
+const fetchTodayGames = async () => {
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+  const res = await fetch(`${API}/schedule?sportId=1&date=${today}&hydrate=team,linescore,probablePitcher,person,venue,stats`);
+  if (!res.ok) throw new Error("API error");
+  const data = await res.json();
+  return data.dates?.[0]?.games || [];
+};
+
+const fetchStandings = async () => {
+  const season = new Date().getFullYear();
+  const res = await fetch(`${API}/standings?leagueId=103,104&season=${season}&standingsTypes=regularSeason`);
+  if (!res.ok) throw new Error("standings error");
+  return (await res.json()).records || [];
+};
+
+const fetchTeamStats = async (teamId) => {
+  try {
+    const season = new Date().getFullYear();
+    const res = await fetch(`${API}/teams/${teamId}/stats?stats=season&group=hitting,pitching&season=${season}`);
+    return (await res.json()).stats || [];
+  } catch { return []; }
+};
+
+// Fetch roster for player props
+const fetchRoster = async (teamId) => {
+  try {
+    const res = await fetch(`${API}/teams/${teamId}/roster?rosterType=active`);
+    return (await res.json()).roster || [];
+  } catch { return []; }
+};
+
+// ─── MATH ENGINE ─────────────────────────────────────────────────────────────
+const log5 = (pA, pB) => {
+  const n = pA - pA * pB, d = pA + pB - 2 * pA * pB;
+  return d === 0 ? 0.5 : Math.min(0.93, Math.max(0.07, n / d));
+};
+const eraToRunFactor = (era) => Math.max(0.5, Math.min(1.5, (4.5 - era) / 4.5 + 1));
+const opsToRunFactor = (ops) => 0.5 + (ops / 0.750) * 0.5;
+const norm = (val, min, max) => Math.round(Math.min(100, Math.max(0, ((val - min) / (max - min)) * 100)));
+const toAmerican = (p) => {
+  if (p <= 0 || p >= 1) return "N/A";
+  return p >= 0.5 ? `-${Math.round((p / (1 - p)) * 100)}` : `+${Math.round(((1 - p) / p) * 100)}`;
+};
+const probToDecimal = (p) => p <= 0 ? 1 : 1 / p;
+
+// ─── PLAYER PROPS ENGINE ──────────────────────────────────────────────────────
+// Genera props de jugadores basados en estadísticas del equipo y ERA del rival
+const generatePlayerProps = (analyses, teamStatsMap) => {
+  const props = [];
+
+  // Props de pitchers abridores
+  const pitcherProps = [
+    { stat: "Ponches (K)", line: 5.5, overKey: "k9_high", baseProb: 0.54 },
+    { stat: "Ponches (K)", line: 4.5, overKey: "k9_med",  baseProb: 0.63 },
+    { stat: "Innings Lanzados", line: 5.5, overKey: "ip_high", baseProb: 0.52 },
+  ];
+
+  // Props de bateadores
+  const batterProps = [
+    { stat: "Hits", line: 0.5, overKey: "hits_half", baseProb: 0.62 },
+    { stat: "Total Bases", line: 1.5, overKey: "tb_1", baseProb: 0.55 },
+    { stat: "Carreras + CI", line: 0.5, overKey: "rbi_run", baseProb: 0.52 },
+    { stat: "HR", line: 0.5, overKey: "hr", baseProb: 0.12 },
+    { stat: "Hits", line: 1.5, overKey: "hits_1", baseProb: 0.38 },
+  ];
+
+  // Mock elite players per team with realistic 2025 stats
+  const elitePlayers = {
+    // [teamAbbr]: [{name, pos, avg, ops, hr, rbi, k9, era}]
+    NYY: [
+      { name: "A. Judge",    pos: "RF", avg: 0.290, ops: 1.020, hr: 18, rbi: 52, type: "bat" },
+      { name: "J. Soto",     pos: "LF", avg: 0.278, ops: 0.930, hr: 12, rbi: 41, type: "bat" },
+      { name: "G. Cole",     pos: "SP", era: 3.10, k9: 10.8, ip: 6.1, type: "pit" },
+    ],
+    LAD: [
+      { name: "F. Freeman",  pos: "1B", avg: 0.305, ops: 0.990, hr: 14, rbi: 55, type: "bat" },
+      { name: "S. Ohtani",   pos: "DH", avg: 0.295, ops: 1.010, hr: 22, rbi: 58, type: "bat" },
+      { name: "Y. Yamamoto", pos: "SP", era: 3.05, k9: 9.8,  ip: 6.2, type: "pit" },
+    ],
+    HOU: [
+      { name: "J. Altuve",   pos: "2B", avg: 0.285, ops: 0.830, hr: 8,  rbi: 38, type: "bat" },
+      { name: "Y. Alvarez",  pos: "DH", avg: 0.295, ops: 0.970, hr: 15, rbi: 50, type: "bat" },
+      { name: "F. Valdez",   pos: "SP", era: 3.45, k9: 8.2,  ip: 5.9, type: "pit" },
+    ],
+    ATL: [
+      { name: "R. Acuña",    pos: "RF", avg: 0.300, ops: 0.960, hr: 12, rbi: 44, type: "bat" },
+      { name: "M. Olson",    pos: "1B", avg: 0.265, ops: 0.880, hr: 16, rbi: 51, type: "bat" },
+      { name: "C. Sale",     pos: "SP", era: 3.30, k9: 10.2, ip: 6.0, type: "pit" },
+    ],
+    BOS: [
+      { name: "R. Devers",   pos: "3B", avg: 0.278, ops: 0.890, hr: 14, rbi: 48, type: "bat" },
+      { name: "T. Turner",   pos: "SS", avg: 0.292, ops: 0.840, hr: 6,  rbi: 32, type: "bat" },
+      { name: "N. Pivetta",  pos: "SP", era: 4.20, k9: 8.8,  ip: 5.5, type: "pit" },
+    ],
+    SD:  [
+      { name: "X. Bogaerts", pos: "SS", avg: 0.270, ops: 0.800, hr: 8,  rbi: 36, type: "bat" },
+      { name: "J. Profar",   pos: "LF", avg: 0.305, ops: 0.860, hr: 10, rbi: 40, type: "bat" },
+      { name: "M. King",     pos: "SP", era: 3.55, k9: 9.1,  ip: 5.8, type: "pit" },
+    ],
+    SEA: [
+      { name: "J. Rodriguez", pos: "CF", avg: 0.280, ops: 0.850, hr: 10, rbi: 40, type: "bat" },
+      { name: "C. Raleigh",   pos: "C",  avg: 0.240, ops: 0.830, hr: 14, rbi: 44, type: "bat" },
+      { name: "L. Gilbert",   pos: "SP", era: 3.25, k9: 9.5,  ip: 6.3, type: "pit" },
+    ],
+    PHI: [
+      { name: "B. Harper",   pos: "1B", avg: 0.298, ops: 0.980, hr: 16, rbi: 52, type: "bat" },
+      { name: "T. Turner",   pos: "SS", avg: 0.295, ops: 0.890, hr: 9,  rbi: 38, type: "bat" },
+      { name: "Z. Wheeler",  pos: "SP", era: 3.10, k9: 10.5, ip: 6.4, type: "pit" },
+    ],
+    CLE: [
+      { name: "J. Ramírez",  pos: "3B", avg: 0.285, ops: 0.920, hr: 16, rbi: 58, type: "bat" },
+      { name: "S. Kwan",     pos: "LF", avg: 0.290, ops: 0.810, hr: 4,  rbi: 28, type: "bat" },
+      { name: "T. Bibee",    pos: "SP", era: 3.60, k9: 9.2,  ip: 5.8, type: "pit" },
+    ],
+    TOR: [
+      { name: "V. Guerrero", pos: "1B", avg: 0.295, ops: 0.940, hr: 18, rbi: 55, type: "bat" },
+      { name: "D. Springer", pos: "CF", avg: 0.258, ops: 0.800, hr: 10, rbi: 36, type: "bat" },
+      { name: "J. Berrios",  pos: "SP", era: 3.80, k9: 8.5,  ip: 5.9, type: "pit" },
+    ],
+    TB:  [
+      { name: "Y. Díaz",     pos: "1B", avg: 0.268, ops: 0.830, hr: 12, rbi: 42, type: "bat" },
+      { name: "B. Lowe",     pos: "2B", avg: 0.262, ops: 0.820, hr: 10, rbi: 36, type: "bat" },
+      { name: "T. Glasnow",  pos: "SP", era: 3.20, k9: 11.5, ip: 6.1, type: "pit" },
+    ],
+    CHC: [
+      { name: "I. Happ",     pos: "LF", avg: 0.262, ops: 0.810, hr: 9,  rbi: 34, type: "bat" },
+      { name: "S. Suzuki",   pos: "RF", avg: 0.275, ops: 0.820, hr: 8,  rbi: 30, type: "bat" },
+      { name: "S. Imanaga",  pos: "SP", era: 3.35, k9: 10.1, ip: 6.2, type: "pit" },
+    ],
+  };
+
+  analyses.forEach((g) => {
+    const rivalERA = (teamStatsMap[g.home.id]?.era || 4.0);
+    const rivalOPS = (teamStatsMap[g.away.id]?.ops || 0.730);
+
+    [g.home, g.away].forEach((team) => {
+      const players = elitePlayers[team.abbr] || [];
+      const rivalPitchingEra = team.abbr === g.home.abbr
+        ? (teamStatsMap[g.away.id]?.era || 4.0)
+        : (teamStatsMap[g.home.id]?.era || 4.0);
+
+      players.forEach((p) => {
+        if (p.type === "pit") {
+          // Pitcher K prop
+          const kAdj = (p.k9 / 9) * (1 + (rivalOPS - 0.730) * 0.5);
+          const kProb5 = Math.min(0.82, Math.max(0.35, 0.50 + (p.k9 - 8.5) * 0.04));
+          const kProb4 = Math.min(0.88, kProb5 + 0.12);
+          const ipProb = Math.min(0.78, Math.max(0.35, 0.50 + (p.ip - 5.5) * 0.08));
+
+          props.push({
+            player: p.name, team: team.abbr, pos: p.pos,
+            game: `${g.away.abbr} @ ${g.home.abbr}`,
+            prop: `Más de 5.5 K`, type: "PITCHER",
+            prob: kProb5, odds: toAmerican(kProb5),
+            confidence: Math.round(kProb5 * 100),
+            stat: `ERA ${p.era} · K/9 ${p.k9}`,
+            value: kProb5 * 80,
+          });
+          props.push({
+            player: p.name, team: team.abbr, pos: p.pos,
+            game: `${g.away.abbr} @ ${g.home.abbr}`,
+            prop: `Más de 4.5 K`, type: "PITCHER",
+            prob: kProb4, odds: toAmerican(kProb4),
+            confidence: Math.round(kProb4 * 100),
+            stat: `ERA ${p.era} · K/9 ${p.k9}`,
+            value: kProb4 * 70,
+          });
+          props.push({
+            player: p.name, team: team.abbr, pos: p.pos,
+            game: `${g.away.abbr} @ ${g.home.abbr}`,
+            prop: `Más de 5.5 IP`, type: "PITCHER",
+            prob: ipProb, odds: toAmerican(ipProb),
+            confidence: Math.round(ipProb * 100),
+            stat: `ERA ${p.era} · IP prom ${p.ip}`,
+            value: ipProb * 65,
+          });
+        } else {
+          // Batter props
+          const hitProb = Math.min(0.80, Math.max(0.30, 0.55 + (p.avg - 0.260) * 2.0 - (rivalPitchingEra - 4.0) * 0.04));
+          const tbProb  = Math.min(0.75, Math.max(0.30, 0.48 + (p.ops - 0.800) * 0.8));
+          const rbiProb = Math.min(0.70, Math.max(0.25, 0.45 + (p.rbi / 162) * 3.0));
+          const hrProb  = Math.min(0.22, Math.max(0.06, (p.hr / 162) * 1.8));
+
+          props.push({
+            player: p.name, team: team.abbr, pos: p.pos,
+            game: `${g.away.abbr} @ ${g.home.abbr}`,
+            prop: `Más de 0.5 Hits`, type: "BATEADOR",
+            prob: hitProb, odds: toAmerican(hitProb),
+            confidence: Math.round(hitProb * 100),
+            stat: `AVG .${Math.round(p.avg*1000)} · OPS .${Math.round(p.ops*1000)}`,
+            value: hitProb * 75,
+          });
+          props.push({
+            player: p.name, team: team.abbr, pos: p.pos,
+            game: `${g.away.abbr} @ ${g.home.abbr}`,
+            prop: `Más de 1.5 Bases Totales`, type: "BATEADOR",
+            prob: tbProb, odds: toAmerican(tbProb),
+            confidence: Math.round(tbProb * 100),
+            stat: `OPS .${Math.round(p.ops*1000)} · HR ${p.hr}`,
+            value: tbProb * 68,
+          });
+          props.push({
+            player: p.name, team: team.abbr, pos: p.pos,
+            game: `${g.away.abbr} @ ${g.home.abbr}`,
+            prop: `Más de 0.5 Carreras+CI`, type: "BATEADOR",
+            prob: rbiProb, odds: toAmerican(rbiProb),
+            confidence: Math.round(rbiProb * 100),
+            stat: `RBI ${p.rbi} · HR ${p.hr}`,
+            value: rbiProb * 60,
+          });
+          if (p.hr >= 12) {
+            props.push({
+              player: p.name, team: team.abbr, pos: p.pos,
+              game: `${g.away.abbr} @ ${g.home.abbr}`,
+              prop: `Más de 0.5 HR`, type: "BATEADOR",
+              prob: hrProb, odds: toAmerican(hrProb),
+              confidence: Math.round(hrProb * 100),
+              stat: `HR ${p.hr} en temporada`,
+              value: hrProb * 90,
+            });
+          }
+        }
+      });
+    });
+  });
+
+  return props.sort((a, b) => b.value - a.value);
+};
+
+// ─── GAME ANALYSIS ────────────────────────────────────────────────────────────
+const analyzeGame = (game, winPctMap, teamStatsMap) => {
+  const homeId = game.teams?.home?.team?.id;
+  const awayId = game.teams?.away?.team?.id;
+  const homeName = game.teams?.home?.team?.teamName || game.teams?.home?.team?.name || "Local";
+  const awayName = game.teams?.away?.team?.teamName || game.teams?.away?.team?.name || "Visit.";
+  const homeAbbr = game.teams?.home?.team?.abbreviation || homeName.slice(0, 3).toUpperCase();
+  const awayAbbr = game.teams?.away?.team?.abbreviation || awayName.slice(0, 3).toUpperCase();
+  const hWp = winPctMap[homeId] || 0.500;
+  const aWp = winPctMap[awayId] || 0.500;
+  const homePitcher = game.teams?.home?.probablePitcher ? `${game.teams.home.probablePitcher.lastName}.${(game.teams.home.probablePitcher.firstName||"")[0]||""}` : "TBD";
+  const awayPitcher = game.teams?.away?.probablePitcher ? `${game.teams.away.probablePitcher.lastName}.${(game.teams.away.probablePitcher.firstName||"")[0]||""}` : "TBD";
+  const hs = teamStatsMap[homeId] || {}, as = teamStatsMap[awayId] || {};
+  const homeOPS=hs.ops||0.730, awayOPS=as.ops||0.730;
+  const homeERA=hs.era||4.00, awayERA=as.era||4.00;
+  const homeM1=norm(1/(homeERA*(hs.whip||1.25)),1/(14),1/(1.6));
+  const awayM1=norm(1/(awayERA*(as.whip||1.25)),1/(14),1/(1.6));
+  const homeM2=norm(hWp,0.35,0.70), awayM2=norm(aWp,0.35,0.70);
+  const homeM3=norm(opsToRunFactor(awayOPS)/eraToRunFactor(homeERA),0.4,1.6);
+  const awayM3=norm(opsToRunFactor(homeOPS)/eraToRunFactor(awayERA),0.4,1.6);
+  const homeM4=norm(hs.runDiff||0,-80,80), awayM4=norm(as.runDiff||0,-80,80);
+  const homeComp=homeM1*0.30+homeM2*0.25+homeM3*0.25+homeM4*0.20;
+  const awayComp=awayM1*0.30+awayM2*0.25+awayM3*0.25+awayM4*0.20;
+  const homeWinProb=log5(Math.min(0.94,hWp*1.04),Math.min(0.94,aWp*0.96));
+  const awayWinProb=1-homeWinProb;
+  const homeRS=4.3*opsToRunFactor(homeOPS)*eraToRunFactor(awayERA)*((hs.parkFactor||100)/100);
+  const awayRS=4.3*opsToRunFactor(awayOPS)*eraToRunFactor(homeERA)*((hs.parkFactor||100)/100);
+  const tend=(m1,m2,m4)=>{ const a=(m1+m2+m4)/3; return a>=60?"En alza":a<=40?"En baja":"Sin data"; };
+  const confidence=Math.min(95,Math.round(50+Math.abs(homeComp-awayComp)*0.6));
+  return {
+    gameId:game.gamePk||Math.random(),
+    home:{name:homeName,abbr:homeAbbr,id:homeId},
+    away:{name:awayName,abbr:awayAbbr,id:awayId},
+    homePitcher,awayPitcher,
+    venue:game.venue?.name||"",
+    time:fmtTime(game.gameDate),
+    homeWinProb:Math.round(homeWinProb*100),
+    awayWinProb:Math.round(awayWinProb*100),
+    projHome:+homeRS.toFixed(1), projAway:+awayRS.toFixed(1),
+    ou:+(homeRS+awayRS).toFixed(1),
+    homeComposite:+homeComp.toFixed(1), awayComposite:+awayComp.toFixed(1),
+    models:{
+      home:{m1:homeM1,m2:homeM2,m3:homeM3,m4:homeM4,t1:tend(homeM1,homeM2,homeM4),t2:tend(homeM1,homeM2,homeM4),t3:tend(homeM3,homeM2,homeM4),t4:tend(homeM4,homeM2,homeM1),cfRecientes:+homeRS.toFixed(2),ccRecientes:+(homeRS*0.85).toFixed(2),eraAbridor:homeERA,raBullpen:hs.bullpenEra||3.80},
+      away:{m1:awayM1,m2:awayM2,m3:awayM3,m4:awayM4,t1:tend(awayM1,awayM2,awayM4),t2:tend(awayM1,awayM2,awayM4),t3:tend(awayM3,awayM2,awayM4),t4:tend(awayM4,awayM2,awayM1),cfRecientes:+awayRS.toFixed(2),ccRecientes:+(awayRS*0.85).toFixed(2),eraAbridor:awayERA,raBullpen:as.bullpenEra||3.80},
+    },
+    edgeNeto:+(homeComp-awayComp).toFixed(1),
+    confidence,
+    favorite:homeWinProb>=0.5?homeAbbr:awayAbbr,
+    favProb:Math.max(homeWinProb,awayWinProb),
+    homeOdds:toAmerican(homeWinProb),
+    awayOdds:toAmerican(awayWinProb),
+  };
+};
+
+// ─── TARJETAS ENGINE ─────────────────────────────────────────────────────────
+// Tarjeta 1: Abridores por forma reciente (score basado en ERA, IP, QS, 0ER)
+// Tarjeta 2: Equipos por forma reciente (score basado en RF, RA, differential)
+// Tarjeta 3: Bullpens por forma reciente (score basado en bullpen ERA, RA reciente)
+
+const scoreToLetter = (s) => s >= 8 ? "A+" : s >= 6 ? "A" : s >= 4 ? "B" : s >= 2 ? "C" : "D";
+
+const calcTarjetas = (analyses, teamStatsMap) => {
+  // ── Tarjeta 1: Abridores ──────────────────────────────────────────────────
+  // Score = (4.5 - ERA) * 1.5 + (IP - 5.0) * 0.8 + QS * 0.6 - 0ER_games_penalty
+  // Simulamos QS (quality starts) desde ERA e IP promedio
+  const pitchers = [];
+  analyses.forEach(g => {
+    [
+      { abbr: g.home.abbr, pitcher: g.homePitcher, statsId: g.home.id },
+      { abbr: g.away.abbr, pitcher: g.awayPitcher, statsId: g.away.id },
+    ].forEach(({ abbr, pitcher, statsId }) => {
+      if (pitcher === "TBD") return;
+      const st = teamStatsMap[statsId] || {};
+      const era  = st.era  || 4.20;
+      const ip   = st.ip   || 5.5;
+      const whip = st.whip || 1.25;
+      // Estimate QS (quality starts ≈ starts with ERA-like performance ≥6IP, ≤3ER)
+      const estQS    = Math.round(Math.min(5, Math.max(0, (5.5 - era) * 0.9 + (ip - 5.0) * 0.6)));
+      const est0ER   = Math.round(Math.max(0, Math.min(5, (3.5 - era) * 0.8)));
+      const score    = +((4.50 - era) * 1.5 + (ip - 5.0) * 0.8 + estQS * 0.5 - (whip - 1.2) * 1.2).toFixed(2);
+      pitchers.push({ team: abbr, pitcher, era: +era.toFixed(2), ip: +ip.toFixed(2), qs: estQS, er0: est0ER, score, whip: +whip.toFixed(2) });
+    });
+  });
+
+  // Fill with mock pitchers if we have very few
+  const MOCK_PITCHERS = [
+    { team:"NYY", pitcher:"Cole.G",     era:3.10, ip:6.1, qs:4, er0:2, whip:1.10 },
+    { team:"LAD", pitcher:"Yamamoto.Y", era:3.05, ip:6.2, qs:4, er0:3, whip:1.08 },
+    { team:"PHI", pitcher:"Wheeler.Z",  era:3.10, ip:6.4, qs:5, er0:3, whip:1.09 },
+    { team:"SEA", pitcher:"Gilbert.L",  era:3.25, ip:6.3, qs:4, er0:2, whip:1.14 },
+    { team:"MIL", pitcher:"Misiorowski.J", era:2.12, ip:5.67, qs:4, er0:3, whip:1.05 },
+    { team:"CIN", pitcher:"Abbott.A",   era:3.16, ip:5.8, qs:3, er0:2, whip:1.18 },
+    { team:"TB",  pitcher:"Jax.G",      era:0.65, ip:3.07, qs:0, er0:5, whip:0.92 },
+    { team:"OAK", pitcher:"Lopez.J",    era:7.40, ip:4.59, qs:0, er0:0, whip:1.68 },
+    { team:"SD",  pitcher:"Canning.G",  era:6.99, ip:4.15, qs:1, er0:2, whip:1.55 },
+    { team:"HOU", pitcher:"McCullers.JR",era:6.59,ip:4.70, qs:2, er0:0, whip:1.48 },
+    { team:"MIA", pitcher:"Garrett.B",  era:6.31, ip:4.59, qs:2, er0:1, whip:1.44 },
+    { team:"KC",  pitcher:"Falter.B",   era:5.44, ip:4.59, qs:1, er0:0, whip:1.38 },
+  ];
+
+  const usedPitchers = new Set(pitchers.map(p=>p.pitcher));
+  MOCK_PITCHERS.forEach(mp => {
+    if (!usedPitchers.has(mp.pitcher)) {
+      const score = +((4.50 - mp.era) * 1.5 + (mp.ip - 5.0) * 0.8 + mp.qs * 0.5 - (mp.whip - 1.2) * 1.2).toFixed(2);
+      pitchers.push({ ...mp, score });
+    }
+  });
+
+  const pitchersSorted = [...pitchers].sort((a,b) => b.score - a.score);
+
+  // ── Tarjeta 2: Equipos ───────────────────────────────────────────────────
+  // Score = RF * 0.4 - RA * 0.4 + winPct * 8
+  const TEAM_RECORDS = {
+    PHI:{rec:"9-1",rf:5.4,ra:2.5,diff:2.9}, ARI:{rec:"7-3",rf:6.0,ra:3.0,diff:3.0},
+    NYM:{rec:"7-3",rf:7.1,ra:4.3,diff:2.8}, CLE:{rec:"7-3",rf:5.8,ra:3.1,diff:2.7},
+    TB: {rec:"7-3",rf:7.2,ra:4.6,diff:2.6}, LAA:{rec:"3-7",rf:2.0,ra:6.2,diff:-4.2},
+    DET:{rec:"2-8",rf:2.4,ra:5.4,diff:-3.0},HOU:{rec:"3-7",rf:2.2,ra:5.0,diff:-2.8},
+    CHC:{rec:"2-8",rf:3.2,ra:5.8,diff:-2.6},BAL:{rec:"4-6",rf:4.0,ra:6.6,diff:-2.6},
+    NYY:{rec:"6-4",rf:5.2,ra:3.8,diff:1.4}, LAD:{rec:"7-3",rf:5.9,ra:3.2,diff:2.7},
+    ATL:{rec:"6-4",rf:5.5,ra:4.0,diff:1.5}, SEA:{rec:"6-4",rf:4.8,ra:3.5,diff:1.3},
+    MIL:{rec:"5-5",rf:4.5,ra:4.5,diff:0.0},
+  };
+
+  // Build from analyses first, then fill from TEAM_RECORDS
+  const teams = [];
+  const usedTeams = new Set();
+  analyses.forEach(g => {
+    [g.home, g.away].forEach(t => {
+      if (usedTeams.has(t.abbr)) return;
+      usedTeams.add(t.abbr);
+      const tr = TEAM_RECORDS[t.abbr];
+      const st = teamStatsMap[t.id] || {};
+      const rf   = tr?.rf  || +(4.3 * (((st.ops||0.73)/0.73))).toFixed(1);
+      const ra   = tr?.ra  || +(st.era ? st.era * 0.9 : 4.2).toFixed(1);
+      const diff = tr?.diff || +(rf - ra).toFixed(1);
+      const rec  = tr?.rec || "5-5";
+      const [w,l] = rec.split("-").map(Number);
+      const wp   = w / (w+l||10);
+      const score = +(rf * 0.4 - ra * 0.4 + wp * 8).toFixed(2);
+      teams.push({ team: t.abbr, rec, rf, ra, diff, score });
+    });
+  });
+  Object.entries(TEAM_RECORDS).forEach(([abbr, tr]) => {
+    if (usedTeams.has(abbr)) return;
+    const [w,l] = tr.rec.split("-").map(Number);
+    const wp = w / (w+l||10);
+    const score = +(tr.rf * 0.4 - tr.ra * 0.4 + wp * 8).toFixed(2);
+    teams.push({ team: abbr, rec: tr.rec, rf: tr.rf, ra: tr.ra, diff: tr.diff, score });
+  });
+
+  const teamsSorted = [...teams].sort((a,b) => b.score - a.score);
+
+  // ── Tarjeta 3: Bullpens ──────────────────────────────────────────────────
+  // Score = (4.5 - bullpenERA) * 1.8 + holds * 0.3 - blown_saves * 0.5
+  const BULLPEN_EXTRA = {
+    PHI:{holds:8,bs:1}, ATL:{holds:7,bs:1}, NYY:{holds:9,bs:2}, LAD:{holds:10,bs:1},
+    SEA:{holds:9,bs:1}, CLE:{holds:8,bs:2}, TB:{holds:7,bs:2},  HOU:{holds:6,bs:3},
+    MIL:{holds:7,bs:2}, ARI:{holds:6,bs:2}, NYM:{holds:7,bs:3}, BOS:{holds:5,bs:3},
+    LAA:{holds:4,bs:4}, DET:{holds:3,bs:4}, CHC:{holds:5,bs:4}, BAL:{holds:5,bs:3},
+  };
+
+  const bullpens = [];
+  const usedBP = new Set();
+  analyses.forEach(g => {
+    [g.home, g.away].forEach(t => {
+      if (usedBP.has(t.abbr)) return;
+      usedBP.add(t.abbr);
+      const st   = teamStatsMap[t.id] || {};
+      const bpEra = st.bullpenEra || 3.80;
+      const extra = BULLPEN_EXTRA[t.abbr] || { holds: 5, bs: 2 };
+      const score = +((4.5 - bpEra) * 1.8 + extra.holds * 0.3 - extra.bs * 0.5).toFixed(2);
+      bullpens.push({ team: t.abbr, bpEra: +bpEra.toFixed(2), holds: extra.holds, bs: extra.bs, score });
+    });
+  });
+  // Fill from fixed data
+  const BP_MOCK = [
+    {team:"NYY",bpEra:3.10,holds:9,bs:2}, {team:"LAD",bpEra:2.90,holds:10,bs:1},
+    {team:"SEA",bpEra:3.05,holds:9,bs:1}, {team:"ATL",bpEra:3.45,holds:7,bs:1},
+    {team:"PHI",bpEra:3.60,holds:8,bs:1}, {team:"CLE",bpEra:3.15,holds:8,bs:2},
+    {team:"TB", bpEra:3.30,holds:7,bs:2}, {team:"MIL",bpEra:3.50,holds:7,bs:2},
+    {team:"HOU",bpEra:3.20,holds:6,bs:3}, {team:"ARI",bpEra:3.70,holds:6,bs:2},
+    {team:"LAA",bpEra:4.80,holds:4,bs:4}, {team:"DET",bpEra:4.60,holds:3,bs:4},
+    {team:"CHC",bpEra:4.50,holds:5,bs:4}, {team:"BAL",bpEra:4.20,holds:5,bs:3},
+    {team:"BOS",bpEra:3.90,holds:5,bs:3}, {team:"OAK",bpEra:4.90,holds:3,bs:5},
+  ];
+  BP_MOCK.forEach(bp => {
+    if (!usedBP.has(bp.team)) {
+      const score = +((4.5 - bp.bpEra) * 1.8 + bp.holds * 0.3 - bp.bs * 0.5).toFixed(2);
+      bullpens.push({ ...bp, score });
+    }
+  });
+
+  const bullpensSorted = [...bullpens].sort((a,b) => b.score - a.score);
+
+  // Build bullpen map for per-team lookups
+  const bpMap = {};
+  bullpensSorted.forEach(b => { bpMap[b.team] = b.score; });
+
+  // ── Tarjetas 4-6: Ventajas por juego ─────────────────────────────────────
+  // Tarjeta 4: Ventaja de abridor = |pitcherScore_home - pitcherScore_away|
+  // Tarjeta 5: Ventaja de equipo  = |teamScore_home - teamScore_away|
+  // Tarjeta 6: Ventaja de bullpen = |bpScore_home - bpScore_away|
+
+  const pitcherMap = {};
+  pitchersSorted.forEach(p => { pitcherMap[p.team] = p; });
+  const teamMap = {};
+  teamsSorted.forEach(t => { teamMap[t.team] = t.score; });
+
+  const gameEdges = analyses.map(g => {
+    const hPit  = pitcherMap[g.home.abbr];
+    const aPit  = pitcherMap[g.away.abbr];
+    const hPS   = hPit?.score ?? 0;
+    const aPS   = aPit?.score ?? 0;
+    const pitcherEdge = +(hPS - aPS).toFixed(2);
+
+    const hTS   = teamMap[g.home.abbr] ?? 5;
+    const aTS   = teamMap[g.away.abbr] ?? 5;
+    const teamEdge = +(hTS - aTS).toFixed(2);
+
+    const hBP   = bpMap[g.home.abbr] ?? 0;
+    const aBP   = bpMap[g.away.abbr] ?? 0;
+    const bpEdge = +(hBP - aBP).toFixed(2);
+
+    // Advantage team for each edge
+    const pitAdv  = pitcherEdge >= 0 ? g.home.abbr : g.away.abbr;
+    const teamAdv = teamEdge   >= 0 ? g.home.abbr : g.away.abbr;
+    const bpAdv   = bpEdge    >= 0 ? g.home.abbr : g.away.abbr;
+
+    // ML edge: composite of all 3 + model composites
+    const homeEdge = (g.homeComposite - g.awayComposite) * 0.5 + pitcherEdge * 0.3 + teamEdge * 0.1 + bpEdge * 0.1;
+    const mlTeam   = homeEdge >= 0 ? g.home.abbr : g.away.abbr;
+    const mlEdge   = +Math.abs(homeEdge).toFixed(2);
+
+    // F5 edge: pitcher-heavy (60% pitcher, 40% team)
+    const f5Edge   = +(Math.abs(pitcherEdge) * 0.6 + Math.abs(teamEdge) * 0.4).toFixed(2);
+    const f5Team   = pitcherEdge >= 0 ? g.home.abbr : g.away.abbr;
+
+    // Run line: needs strong composite edge (>6) + team score
+    const rlEdge   = +(Math.abs(homeEdge) * 0.8 + Math.abs(teamEdge) * 0.2).toFixed(2);
+    const rlTeam   = homeEdge >= 0 ? g.home.abbr : g.away.abbr;
+
+    // Heat level (1-5 flames)
+    const heat = (val) => Math.min(5, Math.max(1, Math.round(Math.abs(val) / 2)));
+
+    return {
+      game: `${g.away.abbr} @ ${g.home.abbr}`,
+      home: g.home.abbr, away: g.away.abbr,
+      homePitcher: g.homePitcher, awayPitcher: g.awayPitcher,
+      time: g.time,
+      pitcherEdge, teamEdge, bpEdge,
+      pitAdv, teamAdv, bpAdv,
+      absPitcherEdge: +Math.abs(pitcherEdge).toFixed(2),
+      absTeamEdge:    +Math.abs(teamEdge).toFixed(2),
+      absBpEdge:      +Math.abs(bpEdge).toFixed(2),
+      mlTeam, mlEdge, mlHeat: heat(mlEdge),
+      f5Team,  f5Edge, f5Heat: heat(f5Edge),
+      rlTeam,  rlEdge, rlHeat: heat(rlEdge),
+      heatPit: heat(pitcherEdge), heatTeam: heat(teamEdge), heatBP: heat(bpEdge),
+    };
+  });
+
+  // Tarjeta 4: Top 5 mayor ventaja de abridor
+  const t4 = [...gameEdges].sort((a,b) => b.absPitcherEdge - a.absPitcherEdge).slice(0,5);
+  // Tarjeta 5: Top 5 mayor ventaja de equipo
+  const t5 = [...gameEdges].sort((a,b) => b.absTeamEdge - a.absTeamEdge).slice(0,5);
+  // Tarjeta 6: Top 5 mayor ventaja de bullpen
+  const t6 = [...gameEdges].sort((a,b) => b.absBpEdge - a.absBpEdge).slice(0,5);
+
+  // ── Tarjetas 7-9: Top 5 picks ML / F5 / Run Line ─────────────────────────
+  const t7 = [...gameEdges].sort((a,b) => b.mlEdge - a.mlEdge).slice(0,5);
+  const t8 = [...gameEdges].sort((a,b) => b.f5Edge - a.f5Edge).slice(0,5);
+  const t9 = [...gameEdges].sort((a,b) => b.rlEdge - a.rlEdge).slice(0,5);
+
+  // Heat label
+  const heatLabel = (n) => n >= 5 ? "Volcánico" : n >= 4 ? "Muy alto" : n >= 3 ? "Alto" : n >= 2 ? "Moderado" : "Bajo";
+
+  return {
+    pitchers: { top5: pitchersSorted.slice(0,5), bottom5: [...pitchersSorted].slice(-5).reverse() },
+    teams:    { top5: teamsSorted.slice(0,5),    bottom5: [...teamsSorted].slice(-5).reverse() },
+    bullpens: { top5: bullpensSorted.slice(0,5), bottom5: [...bullpensSorted].slice(-5).reverse() },
+    t4, t5, t6,
+    t7, t8, t9,
+    gameEdges,
+    heatLabel,
+  };
+};
+
+// ─── MAXMIN ENGINE ────────────────────────────────────────────────────────────
+// Clasifica juegos en 4 cuadrantes usando distribución de Poisson simplificada:
+//   P(X < 7)  = Poisson acumulada con λ = total proyectado
+//   P(X >= 7) = 1 - P(X < 7)
+//   P(equipo >= 4 carr) = 1 - Poisson(3, λ_equipo)
+//   P(equipo <  4 carr) = Poisson(3, λ_equipo)
+
+const poissonCDF = (lambda, k) => {
+  // P(X <= k) con distribución de Poisson
+  let sum = 0, term = Math.exp(-lambda);
+  for (let i = 0; i <= k; i++) {
+    sum += term;
+    term *= lambda / (i + 1);
+  }
+  return Math.min(1, sum);
+};
+
+const calcMaxMin = (analyses) => {
+  const gameData = analyses.map((g) => {
+    const λHome = Math.max(0.5, g.projHome);
+    const λAway = Math.max(0.5, g.projAway);
+    const λTotal = λHome + λAway;
+
+    // OU probabilities
+    const probUnder7 = poissonCDF(λTotal, 6);         // P(total <= 6)
+    const probOver7  = 1 - poissonCDF(λTotal, 6);     // P(total >= 7)
+
+    // Run scoring probabilities per team
+    const probHome4plus = 1 - poissonCDF(λHome, 3);   // P(home >= 4)
+    const probAway4plus = 1 - poissonCDF(λAway, 3);   // P(away >= 4)
+    const probHomeSub4  = poissonCDF(λHome, 3);        // P(home < 4)
+    const probAwaySub4  = poissonCDF(λAway, 3);        // P(away < 4)
+
+    return {
+      game:        `${g.away.abbr} @ ${g.home.abbr}`,
+      home:        g.home.abbr,
+      away:        g.away.abbr,
+      homeName:    g.home.name,
+      awayName:    g.away.name,
+      time:        g.time,
+      projHome:    g.projHome,
+      projAway:    g.projAway,
+      λTotal,
+      probUnder7:  Math.round(probUnder7 * 100),
+      probOver7:   Math.round(probOver7  * 100),
+      probHome4p:  Math.round(probHome4plus * 100),
+      probAway4p:  Math.round(probAway4plus * 100),
+      probHomeSub: Math.round(probHomeSub4  * 100),
+      probAwaySub: Math.round(probAwaySub4  * 100),
+    };
+  });
+
+  // Top 3 por categoría
+  const top3Under7  = [...gameData].sort((a,b)=>b.probUnder7-a.probUnder7).slice(0,3);
+  const top3Over7   = [...gameData].sort((a,b)=>b.probOver7-a.probOver7).slice(0,3);
+
+  // Top 3 equipos con mayor prob 4+ (mejor de home/away por juego)
+  const teamScores4plus = [];
+  const teamScoresSub4  = [];
+  gameData.forEach(g => {
+    teamScores4plus.push({ game:g.game, team:g.home, role:"Local",  prob:g.probHome4p, proj:g.projHome, rival:g.away });
+    teamScores4plus.push({ game:g.game, team:g.away, role:"Visit.", prob:g.probAway4p, proj:g.projAway, rival:g.home });
+    teamScoresSub4.push({ game:g.game, team:g.home, role:"Local",  prob:g.probHomeSub, proj:g.projHome, rival:g.away });
+    teamScoresSub4.push({ game:g.game, team:g.away, role:"Visit.", prob:g.probAwaySub, proj:g.projAway, rival:g.home });
+  });
+
+  return {
+    top3Under7,
+    top3Over7,
+    top3team4plus: [...teamScores4plus].sort((a,b)=>b.prob-a.prob).slice(0,3),
+    top3teamSub4:  [...teamScoresSub4 ].sort((a,b)=>b.prob-a.prob).slice(0,3),
+  };
+};
+
+// ─── PARLAY BUILDER (juegos + props combinados) ───────────────────────────────
+const buildParlays = (predictions, playerProps) => {
+  if (predictions.length < 3) return [];
+
+  // Top props por valor (sin repetir jugador)
+  const topProps = [];
+  const seenPlayers = new Set();
+  for (const p of playerProps) {
+    if (!seenPlayers.has(p.player) && p.prob > 0.42 && topProps.length < 30) {
+      seenPlayers.add(p.player);
+      topProps.push(p);
+    }
+  }
+
+  // Opciones por juego (1 selección de equipo por juego)
+  const gameOptions = predictions.map((g) => {
+    const hP=g.homeWinProb/100, aP=g.awayWinProb/100;
+    const ou=g.ou, overProb=hP>0.55?0.54:0.48;
+    const favP=Math.max(hP,aP), favA=hP>=aP?g.home.abbr:g.away.abbr;
+    const cands = [
+      { game:`${g.away.abbr}@${g.home.abbr}`, pick:favA, type:"ML", prob:favP, odds:toAmerican(favP), confidence:g.confidence, value:favP*g.confidence, isTeam:true },
+      { game:`${g.away.abbr}@${g.home.abbr}`, pick:`OVER ${ou.toFixed(1)}`, type:"O/U", prob:overProb, odds:toAmerican(overProb), confidence:Math.round(overProb*100), value:overProb*52, isTeam:true },
+      { game:`${g.away.abbr}@${g.home.abbr}`, pick:`UNDER ${ou.toFixed(1)}`, type:"O/U", prob:1-overProb, odds:toAmerican(1-overProb), confidence:Math.round((1-overProb)*100), value:(1-overProb)*50, isTeam:true },
+    ];
+    if (favP>0.60) cands.push({ game:`${g.away.abbr}@${g.home.abbr}`, pick:`${favA} -1.5`, type:"RL", prob:favP*0.72, odds:toAmerican(favP*0.72), confidence:Math.round(favP*72), value:favP*0.72*65, isTeam:true });
+    return { gameKey:`${g.away.abbr}@${g.home.abbr}`, cands };
+  });
+
+  const strategies = [
+    { name:"🔥 Alta Confianza",      color:"#e85d04", teamPick:(c)=>c.filter(x=>x.confidence>=58).sort((a,b)=>b.confidence-a.confidence)[0], propFilter:(p)=>p.confidence>=65, maxProps:3 },
+    { name:"💎 ML Puro",             color:"#f59e0b", teamPick:(c)=>c.filter(x=>x.type==="ML")[0],                                            propFilter:(p)=>p.type==="BATEADOR", maxProps:3 },
+    { name:"🎯 Mixto + Props",        color:"#00e5a0", teamPick:(c)=>[...c].sort((a,b)=>b.value-a.value)[0],                                   propFilter:(p)=>p.value>50, maxProps:4 },
+    { name:"⚡ Run Lines + Props",    color:"#4a8ab5", teamPick:(c)=>c.find(x=>x.type==="RL")||c.filter(x=>x.type==="ML")[0],                  propFilter:(p)=>p.type==="PITCHER", maxProps:3 },
+    { name:"📊 Totales + Props",      color:"#a855f7", teamPick:(c)=>c.filter(x=>x.type==="O/U").sort((a,b)=>b.prob-a.prob)[0],                propFilter:(p)=>p.confidence>=60, maxProps:3 },
+    { name:"🔥 Favoritos + Bateo",    color:"#ec4899", teamPick:(c)=>c.filter(x=>x.type==="ML"&&x.prob>0.55)[0]||c[0],                         propFilter:(p)=>p.type==="BATEADOR"&&p.prob>0.58, maxProps:4 },
+    { name:"💎 ML + Pitchers K",      color:"#06b6d4", teamPick:(c)=>c.filter(x=>x.type!=="O/U").sort((a,b)=>b.value-a.value)[0],             propFilter:(p)=>p.prop.includes("K")&&p.type==="PITCHER", maxProps:4 },
+    { name:"🎯 Underdog + Props",     color:"#84cc16", teamPick:(c)=>[...c].filter(x=>x.prob<0.50).sort((a,b)=>b.prob-a.prob)[0]||c[0],        propFilter:(p)=>p.confidence>=55, maxProps:3 },
+    { name:"⚡ Modelo Compuesto",     color:"#f97316", teamPick:(c)=>[...c].sort((a,b)=>b.prob*b.confidence-a.prob*a.confidence)[0],           propFilter:(p)=>p.value>55, maxProps:3 },
+    { name:"📊 Máximo Valor",         color:"#6366f1", teamPick:(c)=>[...c].filter(x=>x.prob>0.35).sort((a,b)=>a.prob-b.prob)[0],              propFilter:(p)=>p.confidence>=58, maxProps:4 },
+  ];
+
+  return strategies.map((strat, i) => {
+    // 1. Picks de equipo (1 por juego)
+    const teamPicks = [];
+    for (const { cands } of gameOptions) {
+      const pick = strat.teamPick(cands);
+      if (pick) teamPicks.push(pick);
+    }
+
+    // 2. Props de jugadores (sin repetir jugador, sin repetir juego ya en teamPicks si es el mismo)
+    const usedGames = new Set(teamPicks.map(p => p.game));
+    const propPicks = [];
+    const usedPropPlayers = new Set();
+    for (const prop of topProps) {
+      if (propPicks.length >= strat.maxProps) break;
+      if (!strat.propFilter(prop)) continue;
+      if (usedPropPlayers.has(prop.player)) continue;
+      propPicks.push({ ...prop, isTeam: false });
+      usedPropPlayers.add(prop.player);
+    }
+
+    const allPicks = [...teamPicks, ...propPicks];
+    if (allPicks.length < 3) return null;
+
+    const combinedProb = allPicks.reduce((acc, p) => acc * p.prob, 1);
+    const decimalPayout = allPicks.reduce((acc, p) => acc * probToDecimal(p.prob), 1);
+
+    return {
+      id: i+1, name:strat.name, color:strat.color,
+      picks: allPicks,
+      teamPicks: teamPicks.length,
+      propPicks: propPicks.length,
+      combinedProb: (combinedProb*100).toFixed(3),
+      payout: `${Math.round(decimalPayout)}x`,
+      payoutRaw: decimalPayout,
+    };
+  }).filter(Boolean);
+};
+
+// ─── MOCK DATA ────────────────────────────────────────────────────────────────
+const MOCK_STATS = {
+  147:{ops:0.765,era:3.42,bullpenEra:3.10,whip:1.18,runDiff:45,parkFactor:103},
+  119:{ops:0.788,era:3.15,bullpenEra:2.90,whip:1.10,runDiff:62,parkFactor:96},
+  117:{ops:0.748,era:3.58,bullpenEra:3.20,whip:1.22,runDiff:38,parkFactor:98},
+  144:{ops:0.762,era:3.71,bullpenEra:3.45,whip:1.24,runDiff:41,parkFactor:100},
+  139:{ops:0.718,era:3.55,bullpenEra:3.30,whip:1.21,runDiff:22,parkFactor:95},
+  143:{ops:0.751,era:3.80,bullpenEra:3.60,whip:1.26,runDiff:28,parkFactor:101},
+  141:{ops:0.742,era:3.91,bullpenEra:3.70,whip:1.28,runDiff:18,parkFactor:99},
+  135:{ops:0.728,era:3.65,bullpenEra:3.40,whip:1.23,runDiff:20,parkFactor:92},
+  136:{ops:0.704,era:3.38,bullpenEra:3.05,whip:1.16,runDiff:30,parkFactor:94},
+  114:{ops:0.716,era:3.48,bullpenEra:3.15,whip:1.19,runDiff:25,parkFactor:97},
+  111:{ops:0.749,era:4.12,bullpenEra:3.90,whip:1.31,runDiff:12,parkFactor:104},
+  112:{ops:0.730,era:4.05,bullpenEra:3.85,whip:1.29,runDiff:8,parkFactor:101},
+};
+const MOCK_WP={147:0.580,119:0.625,117:0.555,144:0.570,139:0.532,143:0.555,141:0.518,135:0.540,136:0.525,114:0.548,111:0.510,112:0.495};
+const MOCK_GAMES=[
+  {gamePk:1,teams:{home:{team:{id:147,teamName:"Yankees",abbreviation:"NYY"},probablePitcher:{lastName:"Cole",firstName:"Gerrit"}},away:{team:{id:111,teamName:"Red Sox",abbreviation:"BOS"},probablePitcher:{lastName:"Pivetta",firstName:"Nick"}}},venue:{name:"Yankee Stadium"},gameDate:new Date().setHours(16,5)},
+  {gamePk:2,teams:{home:{team:{id:119,teamName:"Dodgers",abbreviation:"LAD"},probablePitcher:{lastName:"Yamamoto",firstName:"Yoshinobu"}},away:{team:{id:135,teamName:"Padres",abbreviation:"SD"},probablePitcher:{lastName:"King",firstName:"Michael"}}},venue:{name:"Dodger Stadium"},gameDate:new Date().setHours(19,10)},
+  {gamePk:3,teams:{home:{team:{id:117,teamName:"Astros",abbreviation:"HOU"},probablePitcher:{lastName:"Valdez",firstName:"Framber"}},away:{team:{id:136,teamName:"Mariners",abbreviation:"SEA"},probablePitcher:{lastName:"Gilbert",firstName:"Logan"}}},venue:{name:"Minute Maid Park"},gameDate:new Date().setHours(17,10)},
+  {gamePk:4,teams:{home:{team:{id:144,teamName:"Braves",abbreviation:"ATL"},probablePitcher:{lastName:"Sale",firstName:"Chris"}},away:{team:{id:143,teamName:"Phillies",abbreviation:"PHI"},probablePitcher:{lastName:"Wheeler",firstName:"Zack"}}},venue:{name:"Truist Park"},gameDate:new Date().setHours(16,20)},
+  {gamePk:5,teams:{home:{team:{id:139,teamName:"Rays",abbreviation:"TB"},probablePitcher:{lastName:"Glasnow",firstName:"Tyler"}},away:{team:{id:141,teamName:"Blue Jays",abbreviation:"TOR"},probablePitcher:{lastName:"Berrios",firstName:"Jose"}}},venue:{name:"Tropicana Field"},gameDate:new Date().setHours(15,50)},
+  {gamePk:6,teams:{home:{team:{id:114,teamName:"Guardians",abbreviation:"CLE"},probablePitcher:{lastName:"Bibee",firstName:"Tanner"}},away:{team:{id:112,teamName:"Cubs",abbreviation:"CHC"},probablePitcher:{lastName:"Imanaga",firstName:"Shota"}}},venue:{name:"Progressive Field"},gameDate:new Date().setHours(15,40)},
+  {gamePk:7,teams:{home:{team:{id:143,teamName:"Phillies",abbreviation:"PHI"},probablePitcher:{lastName:"Nola",firstName:"Aaron"}},away:{team:{id:144,teamName:"Braves",abbreviation:"ATL"},probablePitcher:{lastName:"Morton",firstName:"Charlie"}}},venue:{name:"Citizens Bank Park"},gameDate:new Date().setHours(17,5)},
+  {gamePk:8,teams:{home:{team:{id:119,teamName:"Dodgers",abbreviation:"LAD"},probablePitcher:{lastName:"Buehler",firstName:"Walker"}},away:{team:{id:135,teamName:"Padres",abbreviation:"SD"},probablePitcher:{lastName:"Cease",firstName:"Dylan"}}},venue:{name:"Dodger Stadium"},gameDate:new Date().setHours(19,10)},
+];
+
+// ─── UI COMPONENTS ────────────────────────────────────────────────────────────
+const Badge = ({ text, color }) => (
+  <span style={{background:`${color}22`,color,border:`1px solid ${color}44`,borderRadius:"4px",padding:"2px 7px",fontSize:"10px",fontWeight:700,letterSpacing:"0.06em"}}>{text}</span>
+);
+const ModelBar = ({ label, score, hasData=true, color }) => (
+  <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"8px"}}>
+    <span style={{fontSize:"10px",color:"#5a7490",minWidth:"32px",fontWeight:700}}>{label}</span>
+    <div style={{flex:1,height:"5px",background:"#0d1e33",borderRadius:"3px",overflow:"hidden"}}>
+      {hasData&&<div style={{height:"100%",width:`${score}%`,background:color,borderRadius:"3px",transition:"width 0.8s cubic-bezier(.4,0,.2,1)"}}/>}
+    </div>
+    <span style={{fontSize:"11px",fontWeight:800,color:hasData?"#c8dae8":"#3a5068",minWidth:"36px",textAlign:"right"}}>
+      {hasData?score.toFixed(1):"Sin data"}
+    </span>
+  </div>
+);
+const TendencyRow = ({ label, value }) => {
+  const color=value==="En alza"?"#00e5a0":value==="En baja"?"#e85d04":"#3a5068";
+  return <div style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #0d1e33"}}><span style={{fontSize:"10px",color:"#5a7490"}}>{label}</span><span style={{fontSize:"10px",fontWeight:800,color}}>{value}</span></div>;
+};
+const StatRow = ({ label, value }) => (
+  <div style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid #0d1e33"}}>
+    <span style={{fontSize:"10px",color:"#5a7490"}}>{label}</span>
+    <span style={{fontSize:"11px",fontWeight:800,color:"#c8dae8"}}>{value}</span>
+  </div>
+);
+
+const GameAnalysis = ({ analysis:g, isOpen, onToggle }) => {
+  const hC="#2196f3", aC="#00e5a0";
+  return (
+    <div style={{background:"#071320",border:"1px solid #1a2e45",borderRadius:"12px",marginBottom:"10px",overflow:"hidden"}}>
+      <div onClick={onToggle} style={{padding:"14px 18px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:"10px"}}>
+        <div>
+          <div style={{fontSize:"17px",fontWeight:900,letterSpacing:"0.06em",fontFamily:"'Barlow Condensed',sans-serif"}}>
+            <span style={{color:aC}}>{g.away.abbr}</span><span style={{color:"#2a3f55",margin:"0 8px"}}>@</span><span style={{color:hC}}>{g.home.abbr}</span>
+          </div>
+          <div style={{fontSize:"10px",color:"#3a5068",marginTop:"2px"}}>Abridores · {g.awayPitcher} vs {g.homePitcher} · {g.time}</div>
+        </div>
+        <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+          <div style={{background:"#00e5a018",border:"1px solid #00e5a044",borderRadius:"20px",padding:"4px 12px",fontSize:"11px",fontWeight:800,color:"#00e5a0"}}>{g.favorite} ML · {g.confidence}% conf.</div>
+          <span style={{color:"#3a5068",fontSize:"14px",transition:"transform 0.2s",transform:isOpen?"rotate(180deg)":"none",display:"inline-block"}}>▼</span>
+        </div>
+      </div>
+      {isOpen&&(
+        <div style={{borderTop:"1px solid #1a2e45"}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"1px",background:"#1a2e45"}}>
+            {[
+              {label:"MARCADOR PROYECTADO",main:`${g.away.abbr} ${g.projAway} – ${g.projHome} ${g.home.abbr}`,sub:`Total proyectado ${g.ou}`},
+              {label:"MERCADO O/U",main:g.ou.toString(),sub:`OU ${g.ou>8.5?"over":"under"}`},
+              {label:"MODELO INTEGRADO",main:`${g.away.abbr} ${g.awayComposite} – ${g.homeComposite} ${g.home.abbr}`,sub:`Edge neto ${g.edgeNeto>0?"+":""}${g.edgeNeto}`},
+              {label:"TENDENCIA GANADORA",main:g.favorite,sub:`${g.favProb>0.6?"Fuerte":"Neutral"}`,accent:true},
+            ].map((s,i)=>(
+              <div key={i} style={{background:"#071320",padding:"14px 16px"}}>
+                <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:"6px"}}>{s.label}</div>
+                <div style={{fontSize:s.label==="MERCADO O/U"?"28px":"14px",fontWeight:900,color:s.accent?"#00e5a0":"#c8dae8",fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1.1}}>{s.main}</div>
+                <div style={{fontSize:"10px",color:"#3a5068",marginTop:"4px"}}>{s.sub}</div>
+                {s.accent&&<div style={{width:"40px",height:"2px",background:"#00e5a0",marginTop:"6px",borderRadius:"1px"}}/>}
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"1px",background:"#1a2e45"}}>
+            {["M1","M2","M3","M4"].map((m,i)=>{
+              const hs=[g.models.home.m1,g.models.home.m2,g.models.home.m3||0,g.models.home.m4][i];
+              const as=[g.models.away.m1,g.models.away.m2,g.models.away.m3||0,g.models.away.m4][i];
+              const w=hs>as?g.home.abbr:g.away.abbr;
+              return <div key={m} style={{background:"#050f1c",padding:"10px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}><span style={{fontSize:"11px",color:"#3a5068",fontWeight:700}}>{m}</span><span style={{fontSize:"13px",fontWeight:900,color:"#00e5a0"}}>{w} {Math.max(hs,as).toFixed(1)}</span></div>;
+            })}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"1px",background:"#1a2e45"}}>
+            {[
+              {team:g.away,models:g.models.away,label:"VISITANTE",color:aC,projRuns:g.projAway,pitcher:g.awayPitcher},
+              {team:g.home,models:g.models.home,label:"LOCAL",color:hC,projRuns:g.projHome,pitcher:g.homePitcher},
+            ].map(({team,models,label,color,projRuns,pitcher})=>{
+              const comp=models.m1*0.30+models.m2*0.25+(models.m3||50)*0.25+models.m4*0.20;
+              return (
+                <div key={team.abbr} style={{background:"#071320",padding:"18px"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"14px"}}>
+                    <div>
+                      <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:"2px"}}>{label}</div>
+                      <div style={{fontSize:"22px",fontWeight:900,color,fontFamily:"'Barlow Condensed',sans-serif"}}>{team.name}</div>
+                      <div style={{fontSize:"10px",color:"#3a5068"}}>Abridor: <span style={{color:"#8aa8c0"}}>{pitcher}</span></div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:"36px",fontWeight:900,color,lineHeight:1,fontFamily:"'Barlow Condensed',sans-serif"}}>{comp.toFixed(1)}</div>
+                      <div style={{fontSize:"10px",color:"#3a5068"}}>{comp>=58?"Fuerte":comp>=48?"Neutral":"Débil"}</div>
+                      <div style={{fontSize:"9px",color:"#3a5068"}}>Proy: {projRuns} carr.</div>
+                    </div>
+                  </div>
+                  <div style={{marginBottom:"14px"}}>
+                    <ModelBar label="M1" score={models.m1} color={color}/>
+                    <ModelBar label="M2" score={models.m2} color={color}/>
+                    <ModelBar label="M3" score={models.m3??0} hasData={models.m3!=null} color={color}/>
+                    <ModelBar label="M4" score={models.m4} color={color}/>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
+                    <div>
+                      <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:"8px"}}>Lectura Rápida</div>
+                      <TendencyRow label="M1 tendencia" value={models.t1}/>
+                      <TendencyRow label="M2 tendencia" value={models.t2}/>
+                      <TendencyRow label="M3 tendencia" value={models.t3}/>
+                      <TendencyRow label="M4 tendencia" value={models.t4}/>
+                    </div>
+                    <div>
+                      <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:"8px"}}>Producción / Daño</div>
+                      <StatRow label="CF recientes" value={models.cfRecientes}/>
+                      <StatRow label="CC recientes" value={models.ccRecientes}/>
+                      <StatRow label="ERA abridor" value={models.eraAbridor.toFixed(2)}/>
+                      <StatRow label="RA bullpen" value={models.raBullpen.toFixed(2)}/>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"1px",background:"#1a2e45"}}>
+            {[
+              {label:`ML ${g.home.abbr}`,value:g.homeOdds,color:hC},
+              {label:`ML ${g.away.abbr}`,value:g.awayOdds,color:aC},
+              {label:`Over ${g.ou}`,value:g.ou>8.5?"-115":"+105",color:"#f59e0b"},
+              {label:"Confianza",value:g.confidence+"%",color:g.confidence>=70?"#00e5a0":"#f59e0b"},
+            ].map(s=>(
+              <div key={s.label} style={{background:"#050f1c",padding:"12px 16px",textAlign:"center"}}>
+                <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:"4px"}}>{s.label}</div>
+                <div style={{fontSize:"18px",fontWeight:900,color:s.color,fontFamily:"'Barlow Condensed',sans-serif"}}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ParlayCard = ({ parlay, index }) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{background:"#071320",border:`1px solid ${parlay.color}33`,borderRadius:"12px",marginBottom:"10px",overflow:"hidden"}}>
+      <div onClick={()=>setOpen(o=>!o)} style={{padding:"16px 18px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",gap:"12px",flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+          <div style={{width:"32px",height:"32px",borderRadius:"50%",background:`${parlay.color}20`,border:`2px solid ${parlay.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"13px",fontWeight:900,color:parlay.color,flexShrink:0}}>{index+1}</div>
+          <div>
+            <div style={{fontSize:"13px",fontWeight:800}}>{parlay.name}</div>
+            <div style={{fontSize:"10px",color:"#3a5068"}}>
+              {parlay.teamPicks} equipos · {parlay.propPicks} props · {parlay.picks.length} total
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:"16px",alignItems:"center",flexWrap:"wrap",justifyContent:"flex-end"}}>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase"}}>Prob. combinada</div>
+            <div style={{fontSize:"14px",fontWeight:900,color:parlay.color}}>{parlay.combinedProb}%</div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase"}}>Pago potencial</div>
+            <div style={{fontSize:"14px",fontWeight:900,color:"#00e5a0"}}>{parlay.payout}</div>
+          </div>
+          <span style={{color:"#3a5068",fontSize:"14px",transition:"transform 0.2s",transform:open?"rotate(180deg)":"none",display:"inline-block"}}>▼</span>
+        </div>
+      </div>
+      {open&&(
+        <div style={{borderTop:`1px solid ${parlay.color}22`,padding:"4px 18px 16px"}}>
+          {/* Team picks section */}
+          {parlay.picks.filter(p=>p.isTeam).length>0&&(
+            <div style={{marginBottom:"8px",paddingTop:"10px"}}>
+              <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:"6px",paddingLeft:"2px"}}>📋 Selecciones de Equipo</div>
+              {parlay.picks.filter(p=>p.isTeam).map((pick,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid #0d1e33"}}>
+                  <div>
+                    <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"2px"}}>{pick.game.replace("@"," @ ")}</div>
+                    <div style={{fontSize:"13px",fontWeight:700}}>{pick.pick}</div>
+                  </div>
+                  <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+                    <Badge text={pick.type} color={pick.type==="ML"?"#4a8ab5":pick.type==="RL"?"#e85d04":"#00e5a0"}/>
+                    <span style={{fontSize:"14px",fontWeight:900,color:parlay.color,fontFamily:"monospace",minWidth:"52px",textAlign:"right"}}>{pick.odds}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {/* Player props section */}
+          {parlay.picks.filter(p=>!p.isTeam).length>0&&(
+            <div style={{marginTop:"8px"}}>
+              <div style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.12em",marginBottom:"6px",paddingLeft:"2px"}}>⚡ Props de Jugadores</div>
+              {parlay.picks.filter(p=>!p.isTeam).map((pick,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid #0d1e33"}}>
+                  <div>
+                    <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"2px"}}>{pick.game.replace("@"," @ ")} · {pick.team} · {pick.pos}</div>
+                    <div style={{fontSize:"13px",fontWeight:700}}>{pick.player} — {pick.prop}</div>
+                    <div style={{fontSize:"10px",color:"#4a6080",marginTop:"1px"}}>{pick.stat}</div>
+                  </div>
+                  <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+                    <Badge text={pick.type} color={pick.type==="PITCHER"?"#a855f7":"#f59e0b"}/>
+                    <span style={{fontSize:"14px",fontWeight:900,color:parlay.color,fontFamily:"monospace",minWidth:"52px",textAlign:"right"}}>{pick.odds}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{marginTop:"12px",padding:"12px",background:"#040d18",borderRadius:"8px",display:"flex",gap:"20px",flexWrap:"wrap"}}>
+            <div><span style={{fontSize:"9px",color:"#3a5068"}}>PAGO x$10: </span><span style={{fontSize:"13px",color:"#00e5a0",fontWeight:800}}>${(10*parlay.payoutRaw).toFixed(0)}</span></div>
+            <div><span style={{fontSize:"9px",color:"#3a5068"}}>PAGO x$25: </span><span style={{fontSize:"13px",color:"#00e5a0",fontWeight:800}}>${(25*parlay.payoutRaw).toFixed(0)}</span></div>
+            <div><span style={{fontSize:"9px",color:"#3a5068"}}>PAGO x$100: </span><span style={{fontSize:"13px",color:"#00e5a0",fontWeight:800}}>${(100*parlay.payoutRaw).toFixed(0)}</span></div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── TARJETAS UI ─────────────────────────────────────────────────────────────
+const TarjetasView = ({ data }) => {
+  if (!data) return <div style={{textAlign:"center",padding:"60px",color:"#3a5068"}}>Sin datos disponibles</div>;
+
+  const PitcherRow = ({ item, rank, isTop }) => {
+    const color = isTop ? "#00e5a0" : "#ff6b6b";
+    const scoreColor = isTop ? "#00e5a0" : "#ff6b6b";
+    return (
+      <div style={{display:"flex",alignItems:"center",gap:"12px",padding:"12px 14px",background:"rgba(255,255,255,0.03)",borderRadius:"10px",marginBottom:"8px",border:`1px solid ${color}18`}}>
+        <div style={{width:"30px",height:"30px",borderRadius:"50%",background:`linear-gradient(135deg,${color},${color}88)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"11px",fontWeight:900,color:"#040d18",flexShrink:0}}>#{rank}</div>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:"3px"}}>
+            <span style={{fontSize:"14px",fontWeight:900,fontFamily:"'Barlow Condensed',sans-serif",color:"#f0f4f8",letterSpacing:"0.04em"}}>{item.pitcher}</span>
+            <span style={{background:`${color}22`,color,border:`1px solid ${color}44`,borderRadius:"4px",padding:"1px 6px",fontSize:"9px",fontWeight:800}}>{item.team}</span>
+          </div>
+          <div style={{fontSize:"10px",color:"#5a7490"}}>
+            ERA {item.era} · IP {item.ip} · QS {item.qs} · 0ER {item.er0}
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:"20px",fontWeight:900,color:scoreColor,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{item.score > 0 ? "" : ""}{item.score}</div>
+          <div style={{fontSize:"9px",color:"#3a5068"}}>score</div>
+        </div>
+      </div>
+    );
+  };
+
+  const TeamRow = ({ item, rank, isTop }) => {
+    const color = isTop ? "#00e5a0" : "#ff6b6b";
+    return (
+      <div style={{display:"flex",alignItems:"center",gap:"12px",padding:"12px 14px",background:"rgba(255,255,255,0.03)",borderRadius:"10px",marginBottom:"8px",border:`1px solid ${color}18`}}>
+        <div style={{width:"30px",height:"30px",borderRadius:"50%",background:`linear-gradient(135deg,${color},${color}88)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"11px",fontWeight:900,color:"#040d18",flexShrink:0}}>#{rank}</div>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:"3px"}}>
+            <span style={{fontSize:"16px",fontWeight:900,fontFamily:"'Barlow Condensed',sans-serif",color:"#f0f4f8",letterSpacing:"0.06em"}}>{item.team}</span>
+            <span style={{fontSize:"11px",color:"#5a7490"}}>{item.rec}</span>
+          </div>
+          <div style={{fontSize:"10px",color:"#5a7490"}}>
+            RF {item.rf} · RA {item.ra} · Diff {item.diff > 0 ? "+" : ""}{item.diff}
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:"20px",fontWeight:900,color,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{item.score}</div>
+          <div style={{fontSize:"9px",color:"#3a5068"}}>score</div>
+        </div>
+      </div>
+    );
+  };
+
+  const BullpenRow = ({ item, rank, isTop }) => {
+    const color = isTop ? "#a855f7" : "#ff6b6b";
+    return (
+      <div style={{display:"flex",alignItems:"center",gap:"12px",padding:"12px 14px",background:"rgba(255,255,255,0.03)",borderRadius:"10px",marginBottom:"8px",border:`1px solid ${color}18`}}>
+        <div style={{width:"30px",height:"30px",borderRadius:"50%",background:`linear-gradient(135deg,${color},${color}88)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"11px",fontWeight:900,color:"#040d18",flexShrink:0}}>#{rank}</div>
+        <div style={{flex:1}}>
+          <div style={{fontSize:"16px",fontWeight:900,fontFamily:"'Barlow Condensed',sans-serif",color:"#f0f4f8",marginBottom:"3px",letterSpacing:"0.06em"}}>{item.team}</div>
+          <div style={{fontSize:"10px",color:"#5a7490"}}>
+            ERA {item.bpEra} · Holds {item.holds} · BS {item.bs}
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:"20px",fontWeight:900,color,fontFamily:"'Barlow Condensed',sans-serif",lineHeight:1}}>{item.score}</div>
+          <div style={{fontSize:"9px",color:"#3a5068"}}>score</div>
+        </div>
+      </div>
+    );
+  };
+
+  const CardSection = ({ title, icon, subtitle, color, children }) => (
+    <div style={{background:"#071320",border:`1px solid ${color}22`,borderRadius:"16px",padding:"20px",marginBottom:"20px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"4px"}}>
+        <span style={{fontSize:"20px"}}>{icon}</span>
+        <div>
+          <div style={{fontSize:"15px",fontWeight:900,color}}>{title}</div>
+          <div style={{fontSize:"10px",color:"#3a5068",marginTop:"2px"}}>{subtitle}</div>
+        </div>
+      </div>
+      <div style={{height:"1px",background:`${color}22`,margin:"14px 0"}}/>
+      {children}
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Tarjeta 1: Abridores */}
+      <CardSection
+        title="Tarjeta 1 · Abridores por Forma Reciente"
+        icon="⚾"
+        subtitle="Top 5 y Bottom 5 abridores del día con su equipo correspondiente."
+        color="#00e5a0"
+      >
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"20px"}}>
+          <div>
+            <div style={{fontSize:"12px",fontWeight:800,color:"#00e5a0",marginBottom:"12px",textTransform:"uppercase",letterSpacing:"0.1em"}}>🏆 Top 5 Abridores</div>
+            {data.pitchers.top5.map((p,i) => <PitcherRow key={i} item={p} rank={i+1} isTop={true}/>)}
+          </div>
+          <div>
+            <div style={{fontSize:"12px",fontWeight:800,color:"#ff6b6b",marginBottom:"12px",textTransform:"uppercase",letterSpacing:"0.1em"}}>📉 Bottom 5 Abridores</div>
+            {data.pitchers.bottom5.map((p,i) => <PitcherRow key={i} item={p} rank={i+1} isTop={false}/>)}
+          </div>
+        </div>
+        <div style={{marginTop:"12px",fontSize:"10px",color:"#3a5068"}}>
+          Score = (4.5 − ERA) × 1.5 + (IP − 5.0) × 0.8 + QS × 0.5 − (WHIP − 1.2) × 1.2
+        </div>
+      </CardSection>
+
+      {/* Tarjeta 2: Equipos */}
+      <CardSection
+        title="Tarjeta 2 · Equipos por Forma Reciente"
+        icon="🏟️"
+        subtitle="Top 5 y Bottom 5 equipos del día, medidos como estado reciente del conjunto."
+        color="#2196f3"
+      >
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"20px"}}>
+          <div>
+            <div style={{fontSize:"12px",fontWeight:800,color:"#00e5a0",marginBottom:"12px",textTransform:"uppercase",letterSpacing:"0.1em"}}>🏆 Top 5 Equipos</div>
+            {data.teams.top5.map((t,i) => <TeamRow key={i} item={t} rank={i+1} isTop={true}/>)}
+          </div>
+          <div>
+            <div style={{fontSize:"12px",fontWeight:800,color:"#ff6b6b",marginBottom:"12px",textTransform:"uppercase",letterSpacing:"0.1em"}}>📉 Bottom 5 Equipos</div>
+            {data.teams.bottom5.map((t,i) => <TeamRow key={i} item={t} rank={i+1} isTop={false}/>)}
+          </div>
+        </div>
+        <div style={{marginTop:"12px",fontSize:"10px",color:"#3a5068"}}>
+          Score = RF × 0.4 − RA × 0.4 + Win% × 8 · RF = Carreras a favor · RA = Carreras en contra
+        </div>
+      </CardSection>
+
+      {/* Tarjeta 3: Bullpens */}
+      <CardSection
+        title="Tarjeta 3 · Bullpens por Forma Reciente"
+        icon="🔥"
+        subtitle="Top 5 y Bottom 5 bullpens medidos por desempeño reciente del relevo."
+        color="#a855f7"
+      >
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"20px"}}>
+          <div>
+            <div style={{fontSize:"12px",fontWeight:800,color:"#a855f7",marginBottom:"12px",textTransform:"uppercase",letterSpacing:"0.1em"}}>🏆 Top 5 Bullpens</div>
+            {data.bullpens.top5.map((b,i) => <BullpenRow key={i} item={b} rank={i+1} isTop={true}/>)}
+          </div>
+          <div>
+            <div style={{fontSize:"12px",fontWeight:800,color:"#ff6b6b",marginBottom:"12px",textTransform:"uppercase",letterSpacing:"0.1em"}}>📉 Bottom 5 Bullpens</div>
+            {data.bullpens.bottom5.map((b,i) => <BullpenRow key={i} item={b} rank={i+1} isTop={false}/>)}
+          </div>
+        </div>
+        <div style={{marginTop:"12px",fontSize:"10px",color:"#3a5068"}}>
+          Score = (4.5 − ERA Bullpen) × 1.8 + Holds × 0.3 − Blown Saves × 0.5
+        </div>
+      </CardSection>
+
+      {/* ── Tarjetas 4-6: Ventajas por juego ── */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"16px",marginBottom:"20px"}}>
+        {[
+          { key:"t4", title:"Tarjeta 4 · Ventaja de Abridor", icon:"🎯", color:"#f59e0b", subtitle:"Top 5 juegos con mayor desnivel entre abridor visitante y local.", edgeKey:"absPitcherEdge", advKey:"pitAdv", heatKey:"heatPit" },
+          { key:"t5", title:"Tarjeta 5 · Ventaja de Equipo",  icon:"📈", color:"#2196f3", subtitle:"Top 5 juegos con mayor diferencia de forma reciente de equipo.", edgeKey:"absTeamEdge",    advKey:"teamAdv", heatKey:"heatTeam" },
+          { key:"t6", title:"Tarjeta 6 · Ventaja de Bullpen", icon:"🛡️", color:"#a855f7", subtitle:"Top 5 juegos donde el relevo crea mayor diferencia estructural.", edgeKey:"absBpEdge",     advKey:"bpAdv",   heatKey:"heatBP" },
+        ].map(({ key, title, icon, color, subtitle, edgeKey, advKey, heatKey }) => (
+          <div key={key} style={{background:"#071320",border:`1px solid ${color}22`,borderRadius:"16px",padding:"18px"}}>
+            <div style={{fontSize:"13px",fontWeight:900,color,marginBottom:"3px"}}>{icon} {title}</div>
+            <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"14px"}}>{subtitle}</div>
+            {data[key].map((g, i) => (
+              <div key={i} style={{display:"flex",alignItems:"center",gap:"10px",padding:"10px 12px",background:"rgba(255,255,255,0.03)",borderRadius:"10px",marginBottom:"8px",border:`1px solid ${color}15`}}>
+                <div style={{width:"28px",height:"28px",borderRadius:"50%",background:`linear-gradient(135deg,${color},${color}88)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"11px",fontWeight:900,color:"#040d18",flexShrink:0}}>#{i+1}</div>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:"13px",fontWeight:900,fontFamily:"'Barlow Condensed',sans-serif",color:"#f0f4f8"}}>
+                    <span style={{color:"#00e5a0"}}>{g.away}</span>
+                    <span style={{color:"#2a3f55",margin:"0 4px"}}>@</span>
+                    <span style={{color:"#2196f3"}}>{g.home}</span>
+                  </div>
+                  <div style={{fontSize:"10px",color:"#5a7490",marginTop:"2px"}}>Ventaja para <span style={{color,fontWeight:800}}>{g[advKey]}</span></div>
+                  <div style={{display:"flex",gap:"2px",marginTop:"4px"}}>
+                    {Array.from({length:5}).map((_,fi)=>(
+                      <span key={fi} style={{fontSize:"12px",opacity:fi<g[heatKey]?1:0.2}}>🔥</span>
+                    ))}
+                  </div>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <div style={{fontSize:"18px",fontWeight:900,color,fontFamily:"'Barlow Condensed',sans-serif"}}>{g[edgeKey]}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* ── Tarjetas 7-9: Top 5 picks ML / F5 / Run Line ── */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"16px",marginBottom:"20px"}}>
+        {[
+          { key:"t7", title:"Tarjeta 7 · Top 5 picks ML",       icon:"🏹", color:"#00e5a0", subtitle:"Los ML más fuertes del día según síntesis completa del modelo.", edgeKey:"mlEdge",  teamKey:"mlTeam",  heatKey:"mlHeat",  suffix:"ML" },
+          { key:"t8", title:"Tarjeta 8 · Top 5 picks F5",       icon:"🧠", color:"#f59e0b", subtitle:"Picks más fuertes para primeras 5 entradas, cargados al abridor.", edgeKey:"f5Edge",  teamKey:"f5Team",  heatKey:"f5Heat",  suffix:"F5" },
+          { key:"t9", title:"Tarjeta 9 · Top 5 picks Run Line", icon:"🚀", color:"#e85d04", subtitle:"Equipos con mejor perfil para ganar por margen.", edgeKey:"rlEdge",  teamKey:"rlTeam",  heatKey:"rlHeat",  suffix:"-1.5" },
+        ].map(({ key, title, icon, color, subtitle, edgeKey, teamKey, heatKey, suffix }) => (
+          <div key={key} style={{background:"#071320",border:`1px solid ${color}22`,borderRadius:"16px",padding:"18px"}}>
+            <div style={{fontSize:"13px",fontWeight:900,color,marginBottom:"3px"}}>{icon} {title}</div>
+            <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"14px"}}>{subtitle}</div>
+            {data[key].map((g, i) => (
+              <div key={i} style={{padding:"10px 12px",background:"rgba(255,255,255,0.03)",borderRadius:"10px",marginBottom:"8px",border:`1px solid ${color}15`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"6px"}}>
+                  <div>
+                    <div style={{fontSize:"14px",fontWeight:900,color,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:"0.04em"}}>
+                      {g[teamKey]} <span style={{fontSize:"11px",opacity:0.7}}>{suffix}</span>
+                    </div>
+                    <div style={{display:"flex",gap:"2px",marginTop:"3px"}}>
+                      {Array.from({length:5}).map((_,fi)=>(
+                        <span key={fi} style={{fontSize:"11px",opacity:fi<g[heatKey]?1:0.2}}>🔥</span>
+                      ))}
+                      <span style={{fontSize:"10px",color:"#5a7490",marginLeft:"4px"}}>{data.heatLabel(g[heatKey])}</span>
+                    </div>
+                  </div>
+                  <div style={{fontSize:"10px",fontWeight:700,color:"#5a7490",background:"#0d1e33",padding:"3px 8px",borderRadius:"20px"}}>Edge {g[edgeKey]}</div>
+                </div>
+                <div style={{fontSize:"11px",color:"#5a7490",fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:"0.04em"}}>
+                  <span style={{color:"#00e5a0"}}>{g.away}</span>
+                  <span style={{color:"#2a3f55",margin:"0 4px"}}>@</span>
+                  <span style={{color:"#2196f3"}}>{g.home}</span>
+                  <span style={{color:"#3a5068",marginLeft:"6px"}}>· {g.awayPitcher} vs {g.homePitcher}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* ── Resumen completo por juego ── */}
+      <CardSection title="🧠 Resumen Completo por Juego" icon="" color="#ec4899" subtitle="Tabla rápida para revisar edges de abridor, equipo, bullpen y la mejor postura por mercado.">
+        <div style={{overflowX:"auto"}}>
+          {/* Header */}
+          <div style={{display:"grid",gridTemplateColumns:"1.8fr 0.8fr 0.8fr 0.8fr 1.1fr 1.1fr 1.1fr",gap:"8px",padding:"8px 12px",background:"#050f1c",borderRadius:"8px",marginBottom:"6px"}}>
+            {["JUEGO","EDGE ABRIDOR","EDGE EQUIPO","EDGE BULLPEN","ML","F5","RUN LINE"].map(h=>(
+              <div key={h} style={{fontSize:"9px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.1em",textAlign:"center"}}>{h}</div>
+            ))}
+          </div>
+          {data.gameEdges.map((g, i) => {
+            const pitColor = g.pitcherEdge > 0 ? "#00e5a0" : "#ff6b6b";
+            const teamColor = g.teamEdge > 0 ? "#00e5a0" : "#ff6b6b";
+            const bpColor = g.bpEdge > 0 ? "#00e5a0" : "#ff6b6b";
+            return (
+              <div key={i} style={{display:"grid",gridTemplateColumns:"1.8fr 0.8fr 0.8fr 0.8fr 1.1fr 1.1fr 1.1fr",gap:"8px",padding:"10px 12px",background:i%2===0?"#071320":"#060e1b",borderRadius:"8px",marginBottom:"4px",alignItems:"center"}}>
+                {/* Game */}
+                <div>
+                  <div style={{fontSize:"13px",fontWeight:900,fontFamily:"'Barlow Condensed',sans-serif"}}>
+                    <span style={{color:"#00e5a0"}}>{g.away}</span>
+                    <span style={{color:"#2a3f55",margin:"0 4px"}}>@</span>
+                    <span style={{color:"#2196f3"}}>{g.home}</span>
+                  </div>
+                  <div style={{fontSize:"9px",color:"#3a5068",marginTop:"1px"}}>{g.awayPitcher} vs {g.homePitcher} · {g.time}</div>
+                </div>
+                {/* Edges */}
+                <div style={{textAlign:"center",fontSize:"13px",fontWeight:800,color:pitColor}}>{g.pitcherEdge > 0 ? "+" : ""}{g.pitcherEdge}</div>
+                <div style={{textAlign:"center",fontSize:"13px",fontWeight:800,color:teamColor}}>{g.teamEdge > 0 ? "+" : ""}{g.teamEdge}</div>
+                <div style={{textAlign:"center",fontSize:"13px",fontWeight:800,color:bpColor}}>{g.bpEdge > 0 ? "+" : ""}{g.bpEdge}</div>
+                {/* ML */}
+                <div style={{textAlign:"center"}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"4px"}}>
+                    <div style={{display:"flex",gap:"1px"}}>
+                      {Array.from({length:5}).map((_,fi)=><span key={fi} style={{fontSize:"10px",opacity:fi<g.mlHeat?1:0.2}}>🔥</span>)}
+                    </div>
+                    <span style={{fontSize:"11px",fontWeight:800,color:"#00e5a0"}}>{g.mlTeam} ML</span>
+                  </div>
+                </div>
+                {/* F5 */}
+                <div style={{textAlign:"center"}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"4px"}}>
+                    <div style={{display:"flex",gap:"1px"}}>
+                      {Array.from({length:5}).map((_,fi)=><span key={fi} style={{fontSize:"10px",opacity:fi<g.f5Heat?1:0.2}}>🔥</span>)}
+                    </div>
+                    <span style={{fontSize:"11px",fontWeight:800,color:"#f59e0b"}}>{g.f5Team} F5</span>
+                  </div>
+                </div>
+                {/* RL */}
+                <div style={{textAlign:"center"}}>
+                  <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"4px"}}>
+                    <div style={{display:"flex",gap:"1px"}}>
+                      {Array.from({length:5}).map((_,fi)=><span key={fi} style={{fontSize:"10px",opacity:fi<g.rlHeat?1:0.2}}>🔥</span>)}
+                    </div>
+                    <span style={{fontSize:"11px",fontWeight:800,color:"#e85d04"}}>{g.rlTeam} -1.5</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{marginTop:"12px",fontSize:"10px",color:"#3a5068"}}>
+          Edge Abridor = score pitcher local − visitante · Edge Equipo = forma reciente local − visitante · Verde = ventaja local · Rojo = ventaja visitante
+        </div>
+      </CardSection>
+    </div>
+  );
+};
+
+// ─── MAXMIN UI ────────────────────────────────────────────────────────────────
+const MaxMinView = ({ data }) => {
+  if (!data) return <div style={{textAlign:"center",padding:"60px",color:"#3a5068"}}>Sin datos disponibles</div>;
+  const { top3Under7, top3Over7, top3team4plus, top3teamSub4 } = data;
+
+  const SectionCard = ({ rank, title, metric, metricVal, sub1, sub2, color }) => (
+    <div style={{position:"relative",background:"linear-gradient(180deg,rgba(255,255,255,0.07),rgba(255,255,255,0.03))",border:"1px solid #1a2e45",borderRadius:"16px",padding:"16px 16px 16px 56px",marginBottom:"10px"}}>
+      <div style={{position:"absolute",left:"14px",top:"16px",width:"30px",height:"30px",borderRadius:"50%",background:`linear-gradient(135deg,${color},${color}99)`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:"12px",fontWeight:900,color:"#040d18"}}>{rank}</div>
+      <div style={{fontSize:"15px",fontWeight:900,fontFamily:"'Barlow Condensed',sans-serif",color:"#f0f4f8",marginBottom:"4px"}}>{title}</div>
+      <div style={{fontSize:"12px",fontWeight:700,color,marginBottom:"4px"}}>{metric}: <strong style={{fontSize:"16px"}}>{metricVal}%</strong></div>
+      <div style={{fontSize:"11px",color:"#5a7490"}}>{sub1}</div>
+      {sub2 && <div style={{fontSize:"11px",color:"#5a7490"}}>{sub2}</div>}
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={{background:"#071320",border:"1px solid #a855f733",borderRadius:"10px",padding:"14px 18px",marginBottom:"18px",display:"flex",gap:"10px",alignItems:"flex-start"}}>
+        <span style={{fontSize:"16px"}}>📊</span>
+        <div style={{fontSize:"11px",color:"#5a7490",lineHeight:1.7}}>
+          <strong style={{color:"#a855f7"}}>MaxMin MLB: </strong>
+          Usa distribución de Poisson para calcular probabilidades de scoring por equipo y juego. Identifica los mejores juegos para apostar Under/Over 7 y los equipos más probables de anotar 4+ o menos de 4 carreras.
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:"16px"}}>
+        {/* Under 7 */}
+        <div style={{background:"#071320",border:"1px solid #1a2e45",borderRadius:"16px",padding:"20px"}}>
+          <div style={{fontSize:"13px",fontWeight:800,color:"#2196f3",marginBottom:"4px"}}>🔵 Juegos con mayor prob. de terminar BAJO 7 carreras</div>
+          <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"14px"}}>P(total ≤ 6 carreras) vía Poisson con λ = proyección total</div>
+          {top3Under7.map((g,i)=>(
+            <SectionCard key={i} rank={`#${i+1}`}
+              title={g.game} color="#2196f3"
+              metric="Prob < 7 carreras" metricVal={g.probUnder7}
+              sub1={`Proyección total: ${g.λTotal.toFixed(2)} carreras`}
+              sub2={`${g.away}: ${g.projAway} | ${g.home}: ${g.projHome}`}
+            />
+          ))}
+        </div>
+
+        {/* Over 7 */}
+        <div style={{background:"#071320",border:"1px solid #1a2e45",borderRadius:"16px",padding:"20px"}}>
+          <div style={{fontSize:"13px",fontWeight:800,color:"#e85d04",marginBottom:"4px"}}>🔴 Juegos con mayor prob. de terminar SOBRE 7 carreras</div>
+          <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"14px"}}>P(total ≥ 7 carreras) = 1 − Poisson acumulada</div>
+          {top3Over7.map((g,i)=>(
+            <SectionCard key={i} rank={`#${i+1}`}
+              title={g.game} color="#e85d04"
+              metric="Prob ≥ 7 carreras" metricVal={g.probOver7}
+              sub1={`Proyección total: ${g.λTotal.toFixed(2)} carreras`}
+              sub2={`${g.away}: ${g.projAway} | ${g.home}: ${g.projHome}`}
+            />
+          ))}
+        </div>
+
+        {/* 4+ */}
+        <div style={{background:"#071320",border:"1px solid #1a2e45",borderRadius:"16px",padding:"20px"}}>
+          <div style={{fontSize:"13px",fontWeight:800,color:"#00e5a0",marginBottom:"4px"}}>✅ Equipos con mayor prob. de anotar 4+ carreras</div>
+          <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"14px"}}>P(equipo ≥ 4) = 1 − Poisson(3, λ_equipo)</div>
+          {top3team4plus.map((g,i)=>(
+            <SectionCard key={i} rank={`#${i+1}`}
+              title={`${g.game} → ${g.team}`} color="#00e5a0"
+              metric="Prob 4+ carreras" metricVal={g.prob}
+              sub1={`Rol: ${g.role} | Rival: ${g.rival}`}
+              sub2={`Proyección: ${g.proj} carreras`}
+            />
+          ))}
+        </div>
+
+        {/* Sub 4 */}
+        <div style={{background:"#071320",border:"1px solid #1a2e45",borderRadius:"16px",padding:"20px"}}>
+          <div style={{fontSize:"13px",fontWeight:800,color:"#ff6b6b",marginBottom:"4px"}}>❌ Equipos con mayor prob. de anotar menos de 4 carreras</div>
+          <div style={{fontSize:"10px",color:"#3a5068",marginBottom:"14px"}}>P(equipo ≤ 3) = Poisson acumulada hasta k=3</div>
+          {top3teamSub4.map((g,i)=>(
+            <SectionCard key={i} rank={`#${i+1}`}
+              title={`${g.game} → ${g.team}`} color="#ff6b6b"
+              metric="Prob < 4 carreras" metricVal={g.prob}
+              sub1={`Rol: ${g.role} | Rival: ${g.rival}`}
+              sub2={`Proyección: ${g.proj} carreras`}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div style={{marginTop:"14px",fontSize:"10px",color:"#3a5068",lineHeight:1.7}}>
+        📊 Metodología: Distribución de Poisson con λ = proyección de carreras derivada de OPS+ ofensivo, ERA+ defensivo y factores de parque · Muestra diaria según pitcheo abridor
+      </div>
+    </div>
+  );
+};
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [tab, setTab] = useState("games");
+  const [analyses, setAnalyses] = useState([]);
+  const [parlays, setParlays] = useState([]);
+  const [tarjetas, setTarjetas] = useState(null);
+  const [maxMin, setMaxMin] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [openGame, setOpenGame] = useState(null);
+  const [dataSource, setDataSource] = useState("live");
+  const [lastUpdate, setLastUpdate] = useState(null);
+
+  const todayPT = new Date().toLocaleDateString("es-MX", {weekday:"long",year:"numeric",month:"long",day:"numeric",timeZone:TZ});
+
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [rawGames, standingsRaw] = await Promise.all([fetchTodayGames(), fetchStandings()]);
+      if (!rawGames.length) throw new Error("no_games");
+      const winPctMap = {};
+      standingsRaw.forEach(div=>(div.teamRecords||[]).forEach(r=>{ winPctMap[r.team.id]=parseFloat(r.winningPercentage)||0.5; }));
+      const teamIds=[...new Set(rawGames.flatMap(g=>[g.teams?.home?.team?.id,g.teams?.away?.team?.id]).filter(Boolean))];
+      const teamStatsMap={};
+      await Promise.allSettled(teamIds.map(async id=>{
+        const stats=await fetchTeamStats(id);
+        const h=stats.find(s=>s.group?.displayName==="hitting")?.splits?.[0]?.stat||{};
+        const p=stats.find(s=>s.group?.displayName==="pitching")?.splits?.[0]?.stat||{};
+        teamStatsMap[id]={ops:parseFloat(h.ops)||0.730,era:parseFloat(p.era)||4.00,bullpenEra:parseFloat(p.era)*0.95||3.80,whip:parseFloat(p.whip)||1.25,runDiff:(parseInt(h.runs)||200)-(parseInt(p.runs)||200),parkFactor:100};
+      }));
+      const result=rawGames.map(g=>analyzeGame(g,winPctMap,teamStatsMap));
+      const props=generatePlayerProps(result,teamStatsMap);
+      setAnalyses(result);
+      setParlays(buildParlays(result,props));
+      setTarjetas(calcTarjetas(result,teamStatsMap));
+      setMaxMin(calcMaxMin(result));
+      setOpenGame(result[0]?.gameId||null);
+      setDataSource("live");
+    } catch {
+      const result=MOCK_GAMES.map(g=>analyzeGame(g,MOCK_WP,MOCK_STATS));
+      const props=generatePlayerProps(result,MOCK_STATS);
+      setAnalyses(result);
+      setParlays(buildParlays(result,props));
+      setTarjetas(calcTarjetas(result,MOCK_STATS));
+      setMaxMin(calcMaxMin(result));
+      setOpenGame(result[0]?.gameId||null);
+      setDataSource("mock");
+    }
+    setLastUpdate(new Date().toLocaleTimeString("es-MX",{timeZone:TZ}));
+    setLoading(false);
+  },[]);
+
+  useEffect(()=>{ loadData(); const iv=setInterval(loadData,60*60*1000); return()=>clearInterval(iv); },[loadData]);
+
+  return (
+    <div style={{minHeight:"100vh",background:"#040d18",color:"#c8dae8",fontFamily:"'IBM Plex Mono',monospace"}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&family=Barlow+Condensed:wght@700;900&display=swap');
+        @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        *{box-sizing:border-box}
+        ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#040d18}::-webkit-scrollbar-thumb{background:#1a2e45;border-radius:3px}
+      `}</style>
+      <header style={{background:"#050f1c",borderBottom:"1px solid #1a2e45",padding:"18px 24px 0",position:"sticky",top:0,zIndex:100}}>
+        <div style={{maxWidth:"1100px",margin:"0 auto"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:"12px",marginBottom:"16px"}}>
+            <div>
+              <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+                <span style={{fontSize:"22px"}}>⚾</span>
+                <h1 style={{margin:0,fontSize:"20px",fontWeight:900,fontFamily:"'Barlow Condensed',sans-serif",letterSpacing:"0.1em"}}>
+                  MLB <span style={{color:"#00e5a0"}}>ORACLE</span>
+                </h1>
+                <span style={{background:dataSource==="live"?"#00e5a018":"#f59e0b18",color:dataSource==="live"?"#00e5a0":"#f59e0b",border:`1px solid ${dataSource==="live"?"#00e5a040":"#f59e0b40"}`,borderRadius:"20px",padding:"2px 10px",fontSize:"9px",fontWeight:700,letterSpacing:"0.1em"}}>
+                  {dataSource==="live"?"● LIVE":"◉ DEMO"}
+                </span>
+                <span style={{background:"#2196f318",color:"#2196f3",border:"1px solid #2196f340",borderRadius:"20px",padding:"2px 10px",fontSize:"9px",fontWeight:700,letterSpacing:"0.1em"}}>🕐 HORA PACÍFICO</span>
+              </div>
+              <div style={{fontSize:"10px",color:"#3a5068",marginTop:"3px",textTransform:"capitalize"}}>{todayPT}</div>
+            </div>
+            <div style={{display:"flex",gap:"10px",alignItems:"center"}}>
+              {lastUpdate&&<span style={{fontSize:"10px",color:"#3a5068"}}>↺ {lastUpdate} PT</span>}
+              <button onClick={loadData} disabled={loading} style={{background:loading?"#1a2e45":"#00e5a0",color:loading?"#3a5068":"#040d18",border:"none",borderRadius:"6px",padding:"8px 16px",fontSize:"11px",fontWeight:800,cursor:loading?"not-allowed":"pointer",fontFamily:"inherit"}}>
+                {loading?"Cargando...":"↻ Actualizar"}
+              </button>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:"0",overflowX:"auto"}}>
+            {[
+              {id:"games",   label:"⚾ Juegos",         count:analyses.length},
+              {id:"parlays", label:"🎯 Parleys + Props", count:parlays.length},
+              {id:"tarjetas", label:"📋 Tarjetas", count:null},
+              {id:"maxmin",  label:"📊 MaxMin MLB",      count:null},
+            ].map(t=>(
+              <button key={t.id} onClick={()=>setTab(t.id)} style={{padding:"10px 18px",border:"none",background:"transparent",cursor:"pointer",fontSize:"12px",fontWeight:700,fontFamily:"inherit",letterSpacing:"0.06em",whiteSpace:"nowrap",color:tab===t.id?"#f0f4f8":"#3a5068",borderBottom:tab===t.id?"2px solid #00e5a0":"2px solid transparent",transition:"all 0.15s"}}>
+                {t.label}{t.count!==null && <span style={{opacity:0.5}}> ({t.count})</span>}
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+      <main style={{maxWidth:"1100px",margin:"0 auto",padding:"20px 20px 60px"}}>
+        {loading?(
+          <div style={{textAlign:"center",padding:"100px 0"}}>
+            <div style={{fontSize:"44px",display:"inline-block",animation:"spin 1.2s linear infinite",marginBottom:"16px"}}>⚾</div>
+            <div style={{color:"#00e5a0",fontSize:"11px",letterSpacing:"0.15em"}}>CARGANDO MLB ORACLE...</div>
+          </div>
+        ):(
+          <div style={{animation:"fadeUp 0.35s ease"}}>
+            {tab==="games"&&(
+              <>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:"16px",flexWrap:"wrap",gap:"8px"}}>
+                  <span style={{fontSize:"11px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.1em"}}>{analyses.length} juegos · click para análisis</span>
+                  <span style={{fontSize:"10px",color:"#3a5068"}}>Horarios en Hora del Pacífico (PT)</span>
+                </div>
+                {analyses.map(g=><GameAnalysis key={g.gameId} analysis={g} isOpen={openGame===g.gameId} onToggle={()=>setOpenGame(openGame===g.gameId?null:g.gameId)}/>)}
+              </>
+            )}
+            {tab==="tarjetas"&&(
+              <>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:"16px",flexWrap:"wrap",gap:"8px"}}>
+                  <span style={{fontSize:"11px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.1em"}}>3 tarjetas · abridores · equipos · bullpens</span>
+                  <span style={{fontSize:"10px",color:"#3a5068"}}>Top 5 y Bottom 5 por forma reciente</span>
+                </div>
+                <TarjetasView data={tarjetas}/>
+              </>
+            )}
+            {tab==="maxmin"&&(
+              <>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:"16px",flexWrap:"wrap",gap:"8px"}}>
+                  <span style={{fontSize:"11px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.1em"}}>modelo maxmin · distribución de poisson</span>
+                  <span style={{fontSize:"10px",color:"#3a5068"}}>Top 3 por categoría · actualizado cada hora</span>
+                </div>
+                <MaxMinView data={maxMin}/>
+              </>
+            )}
+            {tab==="parlays"&&(
+              <>
+                <div style={{background:"#071320",border:"1px solid #f59e0b33",borderRadius:"10px",padding:"14px 18px",marginBottom:"18px",display:"flex",gap:"10px"}}>
+                  <span style={{fontSize:"16px"}}>⚠️</span>
+                  <div style={{fontSize:"11px",color:"#5a7490",lineHeight:1.7}}>
+                    <strong style={{color:"#f59e0b"}}>Aviso: </strong>
+                    Parleys generados por modelo estadístico. Cada parley incluye selecciones de equipo + props de jugadores analizados. No garantizan ganancias. Apuesta responsablemente.
+                  </div>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:"16px",flexWrap:"wrap",gap:"8px"}}>
+                  <span style={{fontSize:"11px",color:"#3a5068",textTransform:"uppercase",letterSpacing:"0.1em"}}>{parlays.length} parleys · equipos + props combinados</span>
+                  <span style={{fontSize:"10px",color:"#3a5068"}}>ML · RL · O/U · K+ · Hits · Bases · CI+Carr</span>
+                </div>
+                {parlays.length===0
+                  ?<div style={{textAlign:"center",padding:"80px",color:"#3a5068"}}>🎯 Se necesitan más juegos para generar parleys</div>
+                  :parlays.map((p,i)=><ParlayCard key={p.id} parlay={p} index={i}/>)
+                }
+              </>
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
